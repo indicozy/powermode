@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# powermode: switch CPU, RAPL and GPU power caps between silent, default and turbo.
+#
+#   powermode silent|default|turbo   apply a mode (root) and record it
+#   powermode boot                  re-apply the recorded mode (powermode.service)
+#   powermode status                show the recorded mode and a live readout (any user)
+#
+# Test hooks: POWERMODE_SYSFS_ROOT is prefixed to every /sys, /run and /var/lib path,
+# POWERMODE_NVIDIA_SMI replaces the nvidia-smi binary.
+set -euo pipefail
+
+ROOT=${POWERMODE_SYSFS_ROOT:-}
+NVSMI=${POWERMODE_NVIDIA_SMI:-nvidia-smi}
+
+PSTATE_DIR=$ROOT/sys/devices/system/cpu/intel_pstate
+CPU_DIR=$ROOT/sys/devices/system/cpu
+RAPL_DIR=$ROOT/sys/class/powercap/intel-rapl:0
+MODE_FILE=$ROOT/var/lib/powermode/mode
+STATE_FILE=$ROOT/run/powermode
+GPU_LIMITS=index,power.min_limit,power.default_limit,power.max_limit
+
+FAILED=0
+
+usage() {
+  echo "usage: powermode silent|default|turbo|boot|status" >&2
+}
+
+warn() {
+  echo "powermode: warning: $*" >&2
+  FAILED=1
+}
+
+# write_sysfs VALUE PATH: a failed write warns and marks the run failed; the run goes on.
+write_sysfs() {
+  { printf '%s\n' "$1" > "$2"; } 2>/dev/null || warn "cannot write $1 to $2"
+}
+
+# write_sysfs_quiet VALUE PATH: a write the kernel may refuse; a refusal is not reported.
+write_sysfs_quiet() {
+  { printf '%s\n' "$1" > "$2"; } 2>/dev/null || true
+}
+
+# read_value PATH: first line of a file, or ? when it cannot be read.
+read_value() {
+  local value=""
+  value=$(head -n 1 "$1" 2>/dev/null) || true
+  printf '%s\n' "${value:-?}"
+}
+
+# read_watts PATH: a RAPL limit in microwatts shown as whole watts, or ?.
+read_watts() {
+  local value
+  value=$(read_value "$1")
+  if [[ $value =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$(( value / 1000000 ))"
+  else
+    printf '?\n'
+  fi
+}
+
+# whole_number VALUE: nvidia-smi prints watts as 150.00; keep the integer part.
+whole_number() {
+  local value=${1//[[:space:]]/}
+  printf '%s\n' "${value%%.*}"
+}
+
+# run_smi ARGS...: a failed nvidia-smi call warns and marks the run failed; the run goes on.
+run_smi() {
+  if ! "$NVSMI" "$@" >/dev/null 2>&1; then
+    warn "nvidia-smi $* failed"
+  fi
+}
+
+# gpu_clock_ceiling INDEX: the silent-mode graphics clock ceiling in MHz, empty if none.
+gpu_clock_ceiling() {
+  case $1 in
+    0) printf '%s\n' 1800 ;;
+    1) printf '%s\n' 1600 ;;
+    *) printf '\n' ;;
+  esac
+}
+
+# apply_gpus LIMIT CLOCKS: LIMIT is min, default or max; CLOCKS is silent (lock the clock
+# ceiling) or reset (release any locked clocks).
+apply_gpus() {
+  local limit_kind=$1 clocks=$2 query idx lo def hi limit ceiling
+  if ! query=$("$NVSMI" --query-gpu="$GPU_LIMITS" --format=csv,noheader,nounits 2>/dev/null); then
+    warn "nvidia-smi could not list the GPUs"
+    return 0
+  fi
+  while IFS=, read -r idx lo def hi; do
+    idx=${idx//[[:space:]]/}
+    [[ $idx =~ ^[0-9]+$ ]] || continue
+    lo=$(whole_number "$lo")
+    def=$(whole_number "$def")
+    hi=$(whole_number "$hi")
+    case $limit_kind in
+      min) limit=$lo ;;
+      default) limit=$def ;;
+      max) limit=$hi ;;
+    esac
+    run_smi -i "$idx" -pl "$limit"
+    if [[ $clocks == silent ]]; then
+      ceiling=$(gpu_clock_ceiling "$idx")
+      if [[ -n $ceiling ]]; then
+        run_smi -i "$idx" -lgc "210,$ceiling"
+      fi
+    else
+      run_smi -i "$idx" -rgc
+    fi
+  done <<< "$query"
+}
+
+# apply_rapl PL1 PL2: long-term and short-term package power limits, in watts.
+apply_rapl() {
+  write_sysfs "$(( $1 * 1000000 ))" "$RAPL_DIR/constraint_0_power_limit_uw"
+  write_sysfs "$(( $2 * 1000000 ))" "$RAPL_DIR/constraint_1_power_limit_uw"
+}
+
+# apply_cpu NO_TURBO MAX_PERF GOVERNOR EPP [quiet]: governor is set before EPP on each CPU.
+# With "quiet" a refused EPP write is not reported (the performance governor refuses it).
+apply_cpu() {
+  local no_turbo=$1 max_perf=$2 governor=$3 epp=$4 quiet=${5:-} dir found=0
+  write_sysfs "$no_turbo" "$PSTATE_DIR/no_turbo"
+  write_sysfs "$max_perf" "$PSTATE_DIR/max_perf_pct"
+  for dir in "$CPU_DIR"/cpu[0-9]*/cpufreq; do
+    if [[ ! -d $dir ]]; then
+      continue
+    fi
+    found=1
+    write_sysfs "$governor" "$dir/scaling_governor"
+    if [[ -n $quiet ]]; then
+      write_sysfs_quiet "$epp" "$dir/energy_performance_preference"
+    else
+      write_sysfs "$epp" "$dir/energy_performance_preference"
+    fi
+  done
+  (( found )) || warn "no cpufreq directories under $CPU_DIR"
+}
+
+# record_mode MODE: remember the mode for boot (/var/lib) and for the i3bar (/run).
+record_mode() {
+  mkdir -p "$(dirname "$MODE_FILE")" "$(dirname "$STATE_FILE")" \
+    && printf '%s\n' "$1" > "$MODE_FILE" \
+    && printf '%s\n' "$1" > "$STATE_FILE" \
+    && chmod 0644 "$MODE_FILE" "$STATE_FILE" \
+    || warn "cannot record mode $1"
+}
+
+apply_mode() {
+  local mode=$1
+  run_smi -pm 1
+  case $mode in
+    silent)
+      apply_gpus min silent
+      apply_rapl 65 90
+      apply_cpu 1 60 powersave power
+      ;;
+    default)
+      apply_gpus default reset
+      apply_rapl 125 190
+      apply_cpu 0 100 powersave balance_performance
+      ;;
+    turbo)
+      apply_gpus max reset
+      apply_rapl 190 190
+      apply_cpu 0 100 performance performance quiet
+      ;;
+  esac
+  if (( FAILED == 0 )); then
+    record_mode "$mode"
+  else
+    echo "powermode: $mode applied with errors; recorded mode unchanged" >&2
+  fi
+}
+
+boot_mode() {
+  local mode=""
+  mode=$(head -n 1 "$MODE_FILE" 2>/dev/null) || true
+  case $mode in
+    silent|default|turbo) ;;
+    *) mode=silent ;;
+  esac
+  echo "powermode: boot: applying $mode"
+  apply_mode "$mode"
+}
+
+show_status() {
+  local query idx limit clock clock_max
+  printf 'mode:          %s\n' "$(read_value "$STATE_FILE")"
+  printf 'no_turbo:      %s\n' "$(read_value "$PSTATE_DIR/no_turbo")"
+  printf 'max_perf_pct:  %s\n' "$(read_value "$PSTATE_DIR/max_perf_pct")"
+  printf 'governor:      %s (cpu0)\n' "$(read_value "$CPU_DIR/cpu0/cpufreq/scaling_governor")"
+  printf 'epp:           %s (cpu0)\n' "$(read_value "$CPU_DIR/cpu0/cpufreq/energy_performance_preference")"
+  printf 'rapl PL1:      %s W\n' "$(read_watts "$RAPL_DIR/constraint_0_power_limit_uw")"
+  printf 'rapl PL2:      %s W\n' "$(read_watts "$RAPL_DIR/constraint_1_power_limit_uw")"
+  if ! query=$("$NVSMI" --query-gpu=index,power.limit,clocks.gr,clocks.max.gr \
+      --format=csv,noheader,nounits 2>/dev/null); then
+    printf 'gpu:           nvidia-smi unavailable\n'
+    return 0
+  fi
+  while IFS=, read -r idx limit clock clock_max; do
+    idx=${idx//[[:space:]]/}
+    [[ $idx =~ ^[0-9]+$ ]] || continue
+    printf 'gpu %s:         limit %s W, clock %s MHz (max %s)\n' \
+      "$idx" "$(whole_number "$limit")" "$(whole_number "$clock")" "$(whole_number "$clock_max")"
+  done <<< "$query"
+}
+
+main() {
+  if (( $# != 1 )); then
+    usage
+    exit 2
+  fi
+  case $1 in
+    silent|default|turbo) apply_mode "$1" ;;
+    boot) boot_mode ;;
+    status) show_status ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+  if (( FAILED )); then
+    exit 1
+  fi
+}
+
+main "$@"

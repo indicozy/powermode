@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# ai-resources: the desk/away switch for AI and agent work.
+#   desk  the owner is at the PC: AI work may use CPUs 8-19 and GPU 1 (RTX 4060) only.
+#   away  AI work may use CPUs 0-19 and both GPUs (0 = RTX 5060 Ti, 1 = RTX 4060).
+# Default when the state file is missing or invalid: desk.
+# Usage: ai-resources [status|mode|cpus|gpus|prefix|desk|away|toggle]
+# Env overrides (tests): AI_RESOURCES_STATE, AI_RESOURCES_NVIDIA_SMI, AI_RESOURCES_PROC,
+#                        AI_RESOURCES_TASKSET, AI_RESOURCES_PKILL.
+set -euo pipefail
+
+STATE=${AI_RESOURCES_STATE:-$HOME/.config/ai-resources/mode}
+NVIDIA_SMI=${AI_RESOURCES_NVIDIA_SMI:-nvidia-smi}
+PROC=${AI_RESOURCES_PROC:-/proc}
+TASKSET=${AI_RESOURCES_TASKSET:-taskset}
+PKILL=${AI_RESOURCES_PKILL:-pkill}
+
+usage() {
+  echo "usage: ai-resources [status|mode|cpus|gpus|prefix|desk|away|toggle]" >&2
+  exit 2
+}
+
+# current_mode: "away" when the state file says away, otherwise "desk" (missing or invalid).
+current_mode() {
+  local raw=""
+  raw=$(tr -d ' \t\r\n\v\f' 2>/dev/null < "$STATE") || raw=""
+  case "$raw" in
+    away) echo away ;;
+    *) echo desk ;;
+  esac
+}
+
+cpus_for() {
+  case "$1" in
+    away) echo 0-19 ;;
+    *) echo 8-19 ;;
+  esac
+}
+
+gpus_for() {
+  case "$1" in
+    away) echo 0,1 ;;
+    *) echo 1 ;;
+  esac
+}
+
+# write_mode MODE: atomic replace of the state file (temp file in the same directory, then mv).
+write_mode() {
+  local dir tmp
+  dir=$(dirname -- "$STATE")
+  mkdir -p -- "$dir"
+  tmp=$(mktemp "$dir/.mode.XXXXXX")
+  if ! printf '%s\n' "$1" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$STATE"
+}
+
+# repin_niced: move every nice-19 process of the current user onto CPUs 8-19 (all threads).
+repin_niced() {
+  local me stat_file pid line rest uid nice count=0
+  local f=()
+  me=$(id -u)
+  for stat_file in "$PROC"/[0-9]*/stat; do
+    [ -r "$stat_file" ] || continue
+    pid=${stat_file#"$PROC"/}
+    pid=${pid%%/*}
+    line=$(cat -- "$stat_file" 2>/dev/null) || continue
+    rest=${line##*) }  # fields from state (field 3) on; the comm may contain spaces and parens
+    read -r -a f <<< "$rest" || true
+    nice=${f[16]:-}    # field 19 = nice
+    [ "$nice" = 19 ] || continue
+    uid=$(awk '/^Uid:/ { print $2; exit }' "$PROC/$pid/status" 2>/dev/null) || uid=""
+    [ "$uid" = "$me" ] || continue
+    if "$TASKSET" -a -cp 8-19 "$pid" >/dev/null 2>&1; then
+      count=$((count + 1))
+    fi
+  done
+  echo "re-pinned $count nice-19 process(es) to CPUs 8-19"
+}
+
+# gpu0_warning: list processes still computing on GPU 0 (not stopped, only reported).
+gpu0_warning() {
+  local index_uuid uuid0 apps users
+  index_uuid=$("$NVIDIA_SMI" --query-gpu=index,uuid --format=csv,noheader 2>/dev/null) || return 0
+  uuid0=$(printf '%s\n' "$index_uuid" | awk -F', *' '$1 == "0" { print $2; exit }') || uuid0=""
+  [ -n "$uuid0" ] || return 0
+  apps=$("$NVIDIA_SMI" --query-compute-apps=gpu_uuid,pid,process_name --format=csv,noheader 2>/dev/null) || return 0
+  users=$(printf '%s\n' "$apps" | awk -F', *' -v u="$uuid0" '$1 == u { print "  pid " $2 " " $3 }') || users=""
+  if [ -n "$users" ]; then
+    echo "warning: GPU 0 (RTX 5060 Ti) is still in use by these processes (not stopped):" >&2
+    printf '%s\n' "$users" >&2
+  fi
+}
+
+status_line() {
+  local m
+  m=$(current_mode)
+  echo "$m cpus=$(cpus_for "$m") gpus=$(gpus_for "$m")"
+}
+
+# set_mode MODE: record the mode, apply the desk side effects, refresh the i3 bar, print status.
+set_mode() {
+  write_mode "$1"
+  if [ "$1" = desk ]; then
+    repin_niced
+    gpu0_warning
+  fi
+  "$PKILL" -USR1 -x i3status >/dev/null 2>&1 || true
+  status_line
+}
+
+[ "$#" -le 1 ] || usage
+case "${1:-status}" in
+  status) status_line ;;
+  mode) current_mode ;;
+  cpus) cpus_for "$(current_mode)" ;;
+  gpus) gpus_for "$(current_mode)" ;;
+  prefix) echo "nice -n 19 taskset -c $(cpus_for "$(current_mode)")" ;;
+  desk | away) set_mode "$1" ;;
+  toggle)
+    if [ "$(current_mode)" = away ]; then
+      set_mode desk
+    else
+      set_mode away
+    fi
+    ;;
+  *) usage ;;
+esac

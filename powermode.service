@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply the recorded power mode (silent, default or turbo)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/powermode boot
+
+[Install]
+WantedBy=multi-user.target
