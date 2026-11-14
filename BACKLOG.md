@@ -4,10 +4,9 @@
 
 Goal: keep RAM free for the owner; AI/agent work must not eat it.
 
-- Put AI work in a systemd user slice `ai.slice` (memory controller is delegated to user@1000, no root
-  needed). `ai-resources prefix` becomes `systemd-run --user --scope --slice=ai.slice nice -n 19 taskset -c …`.
-- desk: `MemoryHigh`/`MemoryMax` on ai.slice (amount TBD, e.g. 16 GB of 31 GB); away: limit lifted.
-  `ai-resources desk|away` applies it live with `systemctl --user set-property ai.slice …`.
-- Protect the desktop session with `MemoryLow` (e.g. 12 GB) so the kernel reclaims from others first.
-- Open: start Claude itself inside ai.slice (change the `claude` alias)? Today it runs in the desktop
-  session scope, so the cap would only cover prefixed jobs. Decide the desk-mode cap.
+- Done: AI work runs in the systemd user slice `ai.slice` (`ai-run`, `ai-resources setup`). The prefix
+  is `ai-run nice -n 19` (plus taskset when cpuset is not delegated). Claude runs as `ai-run tg-claude`.
+- Done: the slice limits CPUs live (`AllowedCPUs` with cpuset delegated by install.sh, re-pin otherwise).
+- Open, owner's decision: the RAM cap amount. The mechanism is not built yet (no MemoryHigh/MemoryMax
+  yet). When chosen: desk → `MemoryHigh`/`MemoryMax` on ai.slice, away → limit lifted, applied by
+  `ai-resources apply`. Also open: `MemoryLow` on the desktop session so the kernel reclaims from others first.

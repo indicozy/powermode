@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# ai-run: run a command in the ai.slice systemd user slice (CPU limits with cpuset, memory later).
+# If no scope can be started (no user bus, systemd-run failing), run the command directly with a warning.
+# Usage: ai-run COMMAND [ARGS...]
+# Env overrides (tests): AI_RUN_SYSTEMD_RUN.
+set -uo pipefail
+
+SYSTEMD_RUN=${AI_RUN_SYSTEMD_RUN:-systemd-run}
+SCOPE=(--user --scope --quiet --slice=ai.slice --collect)
+
+if [ "$#" -lt 1 ]; then
+  echo "usage: ai-run COMMAND [ARGS...]" >&2
+  exit 2
+fi
+
+# Probe with a trivial scope first, so a failed start is told apart from the command's own exit status.
+if "$SYSTEMD_RUN" "${SCOPE[@]}" -- true >/dev/null 2>&1; then
+  exec "$SYSTEMD_RUN" "${SCOPE[@]}" -- "$@"
+fi
+echo "ai-run: warning: could not start an ai.slice scope (no user systemd bus?); running without it" >&2
+exec "$@"

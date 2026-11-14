@@ -7,6 +7,7 @@ BIN=/usr/local/bin/powermode
 SUDOERS=/etc/sudoers.d/powermode
 UNIT=/etc/systemd/system/powermode.service
 OLD_UNIT=/etc/systemd/system/thermal-caps.service
+DELEGATE=/etc/systemd/system/user@.service.d/delegate-cpuset.conf
 
 if (( EUID != 0 )); then
   echo "uninstall.sh: run as root (sudo ./uninstall.sh)" >&2
@@ -16,7 +17,8 @@ fi
 if systemctl cat powermode.service >/dev/null 2>&1; then
   systemctl disable --now powermode.service
 fi
-rm -f "$UNIT" "$SUDOERS" "$BIN"
+rm -f "$UNIT" "$SUDOERS" "$BIN" "$DELEGATE"
+rmdir /etc/systemd/system/user@.service.d 2>/dev/null || true
 rm -rf /var/lib/powermode /run/powermode
 systemctl daemon-reload
 

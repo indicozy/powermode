@@ -7,6 +7,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BIN=/usr/local/bin/powermode
 SUDOERS=/etc/sudoers.d/powermode
 UNIT=/etc/systemd/system/powermode.service
+DELEGATE_DIR=/etc/systemd/system/user@.service.d
+DELEGATE=$DELEGATE_DIR/delegate-cpuset.conf
 OLD_UNIT=/etc/systemd/system/thermal-caps.service
 STATE_DIR=/var/lib/powermode
 TARGET_USER=${SUDO_USER:-}
@@ -46,6 +48,14 @@ if [[ -f $OLD_UNIT ]] && systemctl cat thermal-caps.service >/dev/null 2>&1; the
   systemctl disable --now thermal-caps.service
   echo "disabled thermal-caps.service"
 fi
+
+# Let the user manager delegate the cpuset controller, so ai.slice can limit CPUs itself.
+install -d -m 0755 -o root -g root "$DELEGATE_DIR"
+delegate_scratch=$(mktemp)
+trap 'rm -f "$scratch" "$delegate_scratch"' EXIT
+printf '[Service]\nDelegate=cpu cpuset io memory pids\n' > "$delegate_scratch"
+install -m 0644 -o root -g root "$delegate_scratch" "$DELEGATE"
+echo "installed $DELEGATE (cpuset delegation takes effect after logout/login or reboot)"
 
 systemctl daemon-reload
 systemctl enable powermode.service

@@ -3,20 +3,33 @@
 #   desk  the owner is at the PC: AI work may use CPUs 8-19 and GPU 1 (RTX 4060) only.
 #   away  AI work may use CPUs 0-19 and both GPUs (0 = RTX 5060 Ti, 1 = RTX 4060).
 # Default when the state file is missing or invalid: desk.
-# Usage: ai-resources [status|mode|cpus|gpus|prefix|desk|away|toggle]
+# Usage: ai-resources [status|mode|cpus|gpus|prefix|apply|setup|desk|away|toggle]
+#   setup  link systemd/ai.slice into the user unit dir, reload systemd, start the slice, apply.
+#   apply  push the current state onto running AI work (cpuset on ai.slice when available,
+#          re-pin ai.slice and nice-19 processes). Never fails the caller.
 # Env overrides (tests): AI_RESOURCES_STATE, AI_RESOURCES_NVIDIA_SMI, AI_RESOURCES_PROC,
-#                        AI_RESOURCES_TASKSET, AI_RESOURCES_PKILL.
+#                        AI_RESOURCES_TASKSET, AI_RESOURCES_PKILL, AI_RESOURCES_SYSTEMCTL,
+#                        AI_RESOURCES_CGROUP_ROOT, AI_RESOURCES_UNIT_DIR.
 set -euo pipefail
 
+SELF_DIR=$(cd "$(dirname "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 STATE=${AI_RESOURCES_STATE:-$HOME/.config/ai-resources/mode}
 NVIDIA_SMI=${AI_RESOURCES_NVIDIA_SMI:-nvidia-smi}
 PROC=${AI_RESOURCES_PROC:-/proc}
 TASKSET=${AI_RESOURCES_TASKSET:-taskset}
 PKILL=${AI_RESOURCES_PKILL:-pkill}
+SYSTEMCTL=${AI_RESOURCES_SYSTEMCTL:-systemctl}
+CGROUP_ROOT=${AI_RESOURCES_CGROUP_ROOT:-/sys/fs/cgroup}
+UNIT_DIR=${AI_RESOURCES_UNIT_DIR:-$HOME/.config/systemd/user}
+SLICE=ai.slice
 
 usage() {
-  echo "usage: ai-resources [status|mode|cpus|gpus|prefix|desk|away|toggle]" >&2
+  echo "usage: ai-resources [status|mode|cpus|gpus|prefix|apply|setup|desk|away|toggle]" >&2
   exit 2
+}
+
+warn() {
+  echo "ai-resources: warning: $*" >&2
 }
 
 # current_mode: "away" when the state file says away, otherwise "desk" (missing or invalid).
@@ -56,9 +69,39 @@ write_mode() {
   mv -f -- "$tmp" "$STATE"
 }
 
-# repin_niced: move every nice-19 process of the current user onto CPUs 8-19 (all threads).
+# slice_cgroup_dir: the on-disk cgroup directory of ai.slice, or fails when it has none yet.
+slice_cgroup_dir() {
+  local cg=""
+  cg=$("$SYSTEMCTL" --user show -p ControlGroup --value "$SLICE" 2>/dev/null) || cg=""
+  [ -n "$cg" ] || return 1
+  printf '%s%s\n' "$CGROUP_ROOT" "$cg"
+}
+
+# slice_has_cpuset: true when ai.slice's cgroup offers the cpuset controller.
+slice_has_cpuset() {
+  local dir
+  dir=$(slice_cgroup_dir) || return 1
+  [ -r "$dir/cgroup.controllers" ] && grep -qw cpuset "$dir/cgroup.controllers"
+}
+
+# repin_slice CPUS: move every process in the ai.slice subtree onto CPUS (all threads, failures ignored).
+repin_slice() {
+  local cpus=$1 dir pid count=0
+  dir=$(slice_cgroup_dir) || dir=""
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    while read -r pid; do
+      [ -n "$pid" ] || continue
+      if "$TASKSET" -a -cp "$cpus" "$pid" >/dev/null 2>&1; then
+        count=$((count + 1))
+      fi
+    done < <(find "$dir" -name cgroup.procs -type f -exec cat {} + 2>/dev/null | sort -un)
+  fi
+  echo "re-pinned $count process(es) in $SLICE to CPUs $cpus"
+}
+
+# repin_niced CPUS: move every nice-19 process of the current user onto CPUS (all threads).
 repin_niced() {
-  local me stat_file pid line rest uid nice count=0
+  local cpus=$1 me stat_file pid line rest uid nice count=0
   local f=()
   me=$(id -u)
   for stat_file in "$PROC"/[0-9]*/stat; do
@@ -72,11 +115,11 @@ repin_niced() {
     [ "$nice" = 19 ] || continue
     uid=$(awk '/^Uid:/ { print $2; exit }' "$PROC/$pid/status" 2>/dev/null) || uid=""
     [ "$uid" = "$me" ] || continue
-    if "$TASKSET" -a -cp 8-19 "$pid" >/dev/null 2>&1; then
+    if "$TASKSET" -a -cp "$cpus" "$pid" >/dev/null 2>&1; then
       count=$((count + 1))
     fi
   done
-  echo "re-pinned $count nice-19 process(es) to CPUs 8-19"
+  echo "re-pinned $count nice-19 process(es) to CPUs $cpus"
 }
 
 # gpu0_warning: list processes still computing on GPU 0 (not stopped, only reported).
@@ -93,19 +136,62 @@ gpu0_warning() {
   fi
 }
 
+# apply_state: push the current state onto running work. Only warns on failure; always returns 0.
+apply_state() {
+  local m cpus
+  m=$(current_mode)
+  cpus=$(cpus_for "$m")
+  if slice_has_cpuset; then
+    local out
+    if ! out=$("$SYSTEMCTL" --user set-property "$SLICE" "AllowedCPUs=$cpus" 2>&1); then
+      warn "could not set AllowedCPUs=$cpus on $SLICE: $out"
+    fi
+  fi
+  repin_slice "$cpus" || warn "re-pin of $SLICE failed"
+  repin_niced "$cpus" || warn "re-pin of nice-19 processes failed"
+  if [ "$m" = desk ]; then
+    gpu0_warning || true
+  fi
+  return 0
+}
+
+# setup: link the slice unit, reload the user manager, start the slice, then apply the current state.
+setup() {
+  local src="$SELF_DIR/systemd/$SLICE" dst="$UNIT_DIR/$SLICE" out
+  mkdir -p -- "$UNIT_DIR"
+  ln -sfn -- "$src" "$dst"
+  if ! out=$("$SYSTEMCTL" --user daemon-reload 2>&1); then
+    echo "ai-resources: systemctl --user daemon-reload failed: $out" >&2
+    return 1
+  fi
+  "$SYSTEMCTL" --user start "$SLICE" >/dev/null 2>&1 || warn "could not start $SLICE"
+  echo "linked $dst -> $src"
+  apply_state
+  status_line
+}
+
+# prefix_line: the command prefix for heavy work. The slice limits CPUs itself when cpuset is
+# available; otherwise the prefix pins with taskset.
+prefix_line() {
+  local m
+  m=$(current_mode)
+  if slice_has_cpuset; then
+    echo "ai-run nice -n 19"
+  else
+    echo "ai-run nice -n 19 taskset -c $(cpus_for "$m")"
+  fi
+}
+
 status_line() {
   local m
   m=$(current_mode)
   echo "$m cpus=$(cpus_for "$m") gpus=$(gpus_for "$m")"
 }
 
-# set_mode MODE: record the mode, apply the desk side effects, refresh the i3 bar, print status.
+# set_mode MODE: record the mode, apply it to running work, refresh the i3 bar, print status.
 set_mode() {
   write_mode "$1"
-  if [ "$1" = desk ]; then
-    repin_niced
-    gpu0_warning
-  fi
+  apply_state
   "$PKILL" -USR1 -x i3status >/dev/null 2>&1 || true
   status_line
 }
@@ -116,7 +202,9 @@ case "${1:-status}" in
   mode) current_mode ;;
   cpus) cpus_for "$(current_mode)" ;;
   gpus) gpus_for "$(current_mode)" ;;
-  prefix) echo "nice -n 19 taskset -c $(cpus_for "$(current_mode)")" ;;
+  prefix) prefix_line ;;
+  apply) apply_state ;;
+  setup) setup ;;
   desk | away) set_mode "$1" ;;
   toggle)
     if [ "$(current_mode)" = away ]; then

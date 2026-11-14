@@ -22,7 +22,12 @@ This installs `/usr/local/bin/powermode`, a sudoers rule that lets your user run
 without a password, and `powermode.service`, which re-applies the recorded mode at boot. It disables
 `thermal-caps.service` (its unit file is kept). The mode is seeded as `silent`.
 
-Remove with `sudo ./uninstall.sh`, which re-enables `thermal-caps.service`.
+It also adds `/etc/systemd/system/user@.service.d/delegate-cpuset.conf`, which delegates the cpuset
+controller to your user manager so `ai.slice` can limit CPUs itself. That takes effect after a
+logout/login or a reboot (until then the slice falls back to taskset pins).
+
+Remove with `sudo ./uninstall.sh`, which re-enables `thermal-caps.service` and removes the cpuset
+delegation drop-in.
 
 ## Usage
 
@@ -49,14 +54,39 @@ invalid file means desk.
 
     ai-resources [status]          print e.g. "desk cpus=8-19 gpus=1"
     ai-resources mode|cpus|gpus    print one value
-    ai-resources prefix            print "nice -n 19 taskset -c 8-19" (use: $(ai-resources prefix) cmd)
-    ai-resources desk|away|toggle  switch the state
+    ai-resources prefix            print the prefix for heavy work (use: $(ai-resources prefix) cmd)
+    ai-resources desk|away|toggle  switch the state (applies it, then refreshes i3status)
+    ai-resources apply             push the current state onto running AI work
+    ai-resources setup             install systemd/ai.slice, daemon-reload, start it, apply
 
-Switching to desk re-pins the user's nice-19 processes onto CPUs 8-19 and warns about processes still
-on GPU 0 (it does not stop them). Switching to away changes nothing else. Both refresh i3status.
-The script needs no sudo. Its `~/.local/bin/ai-resources` is a symlink to this script.
+The prefix is `ai-run nice -n 19` when ai.slice has the cpuset controller (the slice limits the CPUs
+itself, so jobs can widen when going away). Without cpuset it is `ai-run nice -n 19 taskset -c 8-19`
+(or 0-19 when away).
 
-Tests (fake state dir, nvidia-smi, /proc, taskset and pkill; never the real state):
+`ai-run CMD...` runs CMD in the systemd user slice `ai.slice` (`~/.local/bin/ai-run` is a symlink to
+this script). If no scope can be started (no user bus), it runs CMD without the slice and prints a
+warning. Claude itself runs as `alias claude='ai-run tg-claude'` in `~/.zshrc`.
 
-    test/ai_resources_run.sh                         shell checks
+On every switch (and on `apply`) the state is applied to running work:
+- with cpuset on ai.slice, `systemctl --user set-property ai.slice AllowedCPUs=` is set to the state's CPUs;
+- every process in the ai.slice subtree and every nice-19 process of the user is re-pinned with
+  `taskset -a -cp` to the state's CPUs, in both directions (away widens jobs back to 0-19);
+- desk warns about processes still on GPU 0 (it does not stop them).
+
+Switching to away changes nothing else. The script needs no sudo. Its `~/.local/bin/ai-resources` is
+a symlink to this script. `ai-resources setup` links the unit into `~/.config/systemd/user/`; the
+slice's properties are set persistently with `set-property`, so they survive a restart of the session.
+
+Claude Code hook: `claude-hook` (symlinked as `~/.local/bin/ai-resources-hook`) is registered for
+`UserPromptSubmit` and `PostToolUse` in `~/.claude/settings.json`. It tells each Claude session the
+live state, power mode and lock on first sight, and again only when they change ("Resources CHANGED by
+the owner: ..."). Its per-session memory is `~/.cache/ai-resources/seen/<session_id>`. It always exits 0.
+A running session learns of a switch on its next prompt or tool use.
+
+Tests (fake state dir, nvidia-smi, /proc, taskset, pkill, systemctl, cgroup tree and systemd-run;
+never the real state, the real user manager or real affinities):
+
+    test/ai_resources_run.sh                         ai-resources and ai-run shell checks
+    test/claude_hook_run.sh                          Claude hook: first sight, change, garbage, session ids
     python3 -B -I -m unittest discover -s test       i3bar power and ai blocks and click handling
+

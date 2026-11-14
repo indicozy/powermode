@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# claude-hook: Claude Code hook (UserPromptSubmit, PostToolUse) that tells a session the live
+# desk/away state, CPU/GPU limits, power mode and lock. Prints hook JSON only when the state is new
+# or changed for that session. Always exits 0 so it never breaks Claude.
+# Env overrides (tests): AI_RESOURCES_BIN, AI_RESOURCES_STATE, AI_RESOURCES_SEEN_DIR,
+#                        POWERMODE_RUN_FILE, POWERMODE_LOCK_FILE, AI_RESOURCES_HOOK_JSON=python.
+set -uo pipefail
+
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || SELF=$0
+HERE=$(cd "$(dirname -- "$SELF")" && pwd)
+AR=${AI_RESOURCES_BIN:-$HERE/ai-resources}
+SEEN_DIR=${AI_RESOURCES_SEEN_DIR:-$HOME/.cache/ai-resources/seen}
+POWER_FILE=${POWERMODE_RUN_FILE:-/run/powermode}
+LOCK_FILE=${POWERMODE_LOCK_FILE:-$HOME/.config/powermode/lock}
+
+input=$(cat 2>/dev/null) || input=""
+
+# json_get KEY: the string value of KEY from the hook JSON on $input, empty if absent or not a string.
+json_get() {
+  if [ "${AI_RESOURCES_HOOK_JSON:-}" != python ] && command -v jq >/dev/null 2>&1; then
+    printf '%s' "$input" | jq -r --arg k "$1" 'if type == "object" and (.[$k] | type) == "string" then .[$k] else empty end' 2>/dev/null
+  else
+    printf '%s' "$input" | python3 -I -c '
+import json, sys
+try:
+    v = json.load(sys.stdin)
+    v = v.get(sys.argv[1]) if isinstance(v, dict) else None
+except Exception:
+    v = None
+if isinstance(v, str):
+    sys.stdout.write(v)
+' "$1" 2>/dev/null
+  fi
+}
+
+# json_out EVENT TEXT: the hook output document.
+json_out() {
+  if [ "${AI_RESOURCES_HOOK_JSON:-}" != python ] && command -v jq >/dev/null 2>&1; then
+    jq -n --arg e "$1" --arg t "$2" '{hookSpecificOutput: {hookEventName: $e, additionalContext: $t}}'
+  else
+    python3 -I -c '
+import json, sys
+print(json.dumps({"hookSpecificOutput": {"hookEventName": sys.argv[1], "additionalContext": sys.argv[2]}}))
+' "$1" "$2"
+  fi
+}
+
+# clean VALUE: keep only the characters allowed in a state field, at most 64 of them.
+clean() {
+  printf '%s' "$1" | tr -cd 'A-Za-z0-9_-' | head -c 64
+}
+
+main() {
+  local sid event status m cpus gpus power lock state seen prev text
+  sid=$(json_get session_id) || sid=""
+  sid=$(printf '%s' "$sid" | tr -cd 'A-Za-z0-9_-' | head -c 128)
+  [ -n "$sid" ] || return 0
+  event=$(json_get hook_event_name) || event=""
+  [[ $event =~ ^[A-Za-z]+$ ]] || return 0
+
+  status=$("$AR" status 2>/dev/null) || return 0
+  m=${status%% *}
+  cpus=${status#* cpus=}; cpus=${cpus%% *}
+  gpus=${status##* gpus=}
+  case "$m" in desk | away) ;; *) return 0 ;; esac
+
+  power=$(head -c 64 "$POWER_FILE" 2>/dev/null | tr -cd 'A-Za-z0-9_-') || power=""
+  power=${power:-?}
+  if [ -f "$LOCK_FILE" ]; then
+    lock=$(clean "$(head -c 64 "$LOCK_FILE" 2>/dev/null)") || lock=""
+  else
+    lock=""
+  fi
+  lock=${lock:-none}
+  state="$m cpus=$cpus gpus=$gpus power=$power lock=$lock"
+
+  seen="$SEEN_DIR/$sid"
+  prev=""
+  [ -r "$seen" ] && prev=$(head -n 1 "$seen" 2>/dev/null) || prev=""
+  if [ "$prev" = "$state" ]; then
+    return 0
+  fi
+
+  if mkdir -p -- "$SEEN_DIR" 2>/dev/null; then
+    local tmp="$seen.tmp.$$"
+    if printf '%s\n' "$state" > "$tmp" 2>/dev/null; then
+      mv -f -- "$tmp" "$seen" 2>/dev/null || rm -f -- "$tmp"
+    fi
+  fi
+
+  local lock_txt=""
+  [ "$lock" = none ] || lock_txt=" Power mode is locked to $lock by the owner; never change it."
+  if [ -z "$prev" ]; then
+    if [ "$m" = desk ]; then
+      text="Machine resources (live, set by the owner): desk — AI work may use CPUs $cpus and GPU index $gpus only (CPUs 0-7 and the RTX 5060 Ti are the owner's)."
+    else
+      text="Machine resources (live, set by the owner): away — the owner is away; AI work may use CPUs $cpus and GPU indexes $gpus (both GPUs)."
+    fi
+    text="$text Use \`\$(ai-resources prefix) <cmd>\` for heavy work and CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=\$(ai-resources gpus). Power mode: $power.$lock_txt Only the owner changes these; don't switch desk/away unless explicitly told; turbo needs explicit permission."
+  else
+    text="Resources CHANGED by the owner: now $m (CPUs $cpus, GPU $gpus). Power mode: $power.$lock_txt"
+    if [ "$m" = desk ] && [ "${prev%% *}" = away ]; then
+      text="$text Stop or move any of your work on GPU 0 (RTX 5060 Ti) now and keep new heavy work on CPUs 8-19 / GPU 1."
+    fi
+    if [ "$m" = away ]; then
+      text="$text You may use CPUs 0-19 and GPUs 0,1 for new work."
+    fi
+  fi
+  json_out "$event" "$text" 2>/dev/null || true
+}
+
+main || true
+exit 0
