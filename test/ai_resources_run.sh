@@ -120,6 +120,7 @@ export FAKE_PKILL_LOG=$T/pkill.log
 export FAKE_SYSTEMCTL_LOG=$T/systemctl.log
 export FAKE_SD_LOG=$T/systemd-run.log
 export AI_RESOURCES_STATE=$T/state/mode
+export AI_RESOURCES_LOCK=$T/cache/lock
 unset FAKE_SYSTEMCTL_FAIL FAKE_SD_FAIL
 
 # reset_logs: empty every fake call log.
@@ -219,6 +220,48 @@ grep -q set-property "$FAKE_SYSTEMCTL_LOG" && bad "no cpuset: systemctl must not
 reset_logs
 run_ar status
 [ ! -s "$T/taskset.log" ] && [ ! -s "$T/pkill.log" ] && ok || bad "status must not re-pin or refresh the bar"
+
+# Repeated switch: the state file is not rewritten (same inode, mv would change it), the bar is not
+# signalled, but the state is still applied, so stragglers are re-pinned.
+printf 'desk\n' > "$AI_RESOURCES_STATE"
+ino_before=$(stat -c %i "$AI_RESOURCES_STATE")
+reset_logs
+run_ar desk
+check "repeat desk output" "re-pinned 3 process(es) in ai.slice to CPUs 8-19
+re-pinned 2 nice-19 process(es) to CPUs 8-19
+warning: GPU 0 (RTX 5060 Ti) is still in use by these processes (not stopped):
+  pid 4242 python3
+desk cpus=8-19 gpus=1"
+check_rc "repeat desk" 0
+[ "$(stat -c %i "$AI_RESOURCES_STATE")" = "$ino_before" ] && ok || bad "repeat desk rewrote the state file"
+[ ! -s "$T/pkill.log" ] && ok || bad "repeat desk signalled the bar: $(cat "$T/pkill.log")"
+[ -s "$T/taskset.log" ] && ok || bad "repeat desk did not re-pin"
+printf 'away\n' > "$AI_RESOURCES_STATE"
+ino_before=$(stat -c %i "$AI_RESOURCES_STATE")
+reset_logs
+run_ar away
+check_last "repeat away output" "away cpus=0-19 gpus=0,1"; check_rc "repeat away" 0
+[ "$(stat -c %i "$AI_RESOURCES_STATE")" = "$ino_before" ] && ok || bad "repeat away rewrote the state file"
+[ ! -s "$T/pkill.log" ] && ok || bad "repeat away signalled the bar"
+[ -s "$T/taskset.log" ] && ok || bad "repeat away did not re-pin"
+# A real change still rewrites the file and signals the bar.
+reset_logs
+run_ar desk
+[ "$(stat -c %i "$AI_RESOURCES_STATE")" != "$ino_before" ] && ok || bad "a real change must rewrite the state file"
+grep -q -- '-USR1 -x i3status' "$T/pkill.log" && ok || bad "a real change must signal the bar"
+printf 'desk\n' > "$AI_RESOURCES_STATE"
+
+# Lock: a run waits while another holds the lock, then goes ahead.
+mkdir -p "$(dirname "$AI_RESOURCES_LOCK")"
+flock "$AI_RESOURCES_LOCK" -c "touch '$T/holding'; sleep 1" &
+for i in $(seq 1 50); do [ -e "$T/holding" ] && break; sleep 0.1; done
+t0=$(date +%s%N)
+run_ar away
+t1=$(date +%s%N)
+check_last "locked away waits then runs" "away cpus=0-19 gpus=0,1"; check_rc "locked away" 0
+[ $(( (t1 - t0) / 1000000 )) -ge 500 ] && ok || bad "locked away did not wait for the holder"
+wait
+rm -f "$T/holding"
 
 # Without a usable nvidia-smi, desk still works and prints no GPU warning.
 OUT=$(AI_RESOURCES_NVIDIA_SMI=$T/missing/nvidia-smi "$AR" desk 2>&1); RC=$?

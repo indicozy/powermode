@@ -17,17 +17,30 @@ Q="--query-gpu=index,power.min_limit,power.default_limit,power.max_limit --forma
 CPU=sys/devices/system/cpu
 RAPL=sys/class/powercap/intel-rapl:0
 
-# The fake nvidia-smi logs every call and answers the two queries powermode makes.
+# The fake nvidia-smi logs every call and answers the queries powermode makes. It keeps each GPU's
+# last "-i N -pl W" in FAKE_SMI_DIR/plN (0 before any write) and reports it as power.limit.
+# FAKE_SMI_SLEEP delays the calls that change clocks or power state (-pm), to test the lock.
 mkdir -p "$T/bin"
 cat > "$T/bin/nvidia-smi" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$FAKE_SMI_LOG"
+if [ -n "${FAKE_SMI_SLEEP:-}" ]; then
+  case "$*" in *-pm*) sleep "$FAKE_SMI_SLEEP" ;; esac
+fi
 if [ -n "${FAKE_SMI_FAIL:-}" ]; then
   case "$*" in *"$FAKE_SMI_FAIL"*) exit 1 ;; esac
+fi
+if [ "${1:-}" = -i ] && [ "${3:-}" = -pl ]; then
+  printf '%s\n' "$4" > "$FAKE_SMI_DIR/pl$2"
 fi
 case "$*" in
   *power.min_limit*) printf '0, 150.00, 180.00, 190.00\n1, 90.00, 115.00, 138.00\n' ;;
   *clocks.max.gr*) printf '0, 150.00, 1200, 3180\n1, 90.00, 210, 3105\n' ;;
+  *"index,power.limit --"*)
+    for i in 0 1; do
+      v=$(cat "$FAKE_SMI_DIR/pl$i" 2>/dev/null || echo 0)
+      printf '%s, %s.00\n' "$i" "$v"
+    done ;;
 esac
 exit 0
 EOF
@@ -54,7 +67,7 @@ run_pm() {
   shift
   rm -f "$tree/smi.log"
   OUT=$(POWERMODE_SYSFS_ROOT="$tree" POWERMODE_NVIDIA_SMI="$T/bin/nvidia-smi" \
-    FAKE_SMI_LOG="$tree/smi.log" FAKE_SMI_FAIL="$SMI_FAIL" "$PM" "$@" 2>&1)
+    FAKE_SMI_LOG="$tree/smi.log" FAKE_SMI_DIR="$tree" FAKE_SMI_FAIL="$SMI_FAIL" "$PM" "$@" 2>&1)
   RC=$?
 }
 
@@ -184,6 +197,9 @@ expect_rejected "empty argument" ""
 expect_rejected "wrong case" Silent
 expect_rejected "extra argument" silent extra
 expect_rejected "shell metacharacters" "silent;touch x"
+expect_rejected "force alone" --force
+expect_rejected "force with status" --force status
+expect_rejected "force with boot" --force boot
 check_file "rejected arguments left no_turbo" "$A/$CPU/intel_pstate/no_turbo" 0
 check_file "rejected arguments kept the turbo state" "$A/run/powermode" turbo
 expect_rapl "$A" 190000000 190000000
@@ -252,6 +268,119 @@ make_tree "$G"
 run_pm "$G" status
 check "status cold exit" 0 "$RC"
 expect_match "status cold mode" '^mode: +\?$' "$OUT"
+
+# Idempotency: a repeated mode is "already" and writes nothing; drift, --force and the 1 W
+# tolerance behave as documented.
+H=$T/h
+make_tree "$H"
+run_pm "$H" turbo
+check "idempotent first turbo exit" 0 "$RC"
+check "idempotent first turbo output" "" "$OUT"
+sleep 1.1
+: > "$H/marker"
+sleep 1.1
+run_pm "$H" turbo
+check "repeat turbo exit" 0 "$RC"
+check "repeat turbo says already" "already turbo" "$OUT"
+check "repeat turbo nvidia-smi calls are reads only" \
+  "$(printf '%s\n' "$Q" "--query-gpu=index,power.limit --format=csv,noheader,nounits")" \
+  "$(smi_log "$H")"
+check "repeat turbo writes no files" "" \
+  "$(find "$H" -newer "$H/marker" -type f ! -name smi.log)"
+expect_state "$H" turbo
+
+printf '1\n' > "$H/$CPU/intel_pstate/no_turbo"
+run_pm "$H" turbo
+check "no_turbo drift exit" 0 "$RC"
+check "no_turbo drift output" "" "$OUT"
+expect_intel "$H" 0 100
+expect_has "no_turbo drift reapplied" "-pm 1" "$(smi_log "$H")"
+
+printf '50\n' > "$H/$CPU/intel_pstate/max_perf_pct"
+run_pm "$H" turbo
+expect_intel "$H" 0 100
+expect_has "max_perf drift reapplied" "-pm 1" "$(smi_log "$H")"
+
+printf '180000000\n' > "$H/$RAPL/constraint_0_power_limit_uw"
+run_pm "$H" turbo
+expect_rapl "$H" 190000000 190000000
+expect_has "RAPL drift reapplied" "-pm 1" "$(smi_log "$H")"
+
+printf '150\n' > "$H/pl0"
+run_pm "$H" turbo
+check_file "GPU 0 drift reapplied" "$H/pl0" 190
+expect_has "GPU drift reapplied" "-i 0 -pl 190" "$(smi_log "$H")"
+
+# Within 1 W counts as a match: 189 W against 190 W is already turbo.
+printf '189\n' > "$H/pl0"
+printf '137\n' > "$H/pl1"
+run_pm "$H" turbo
+check "within 1 W exit" 0 "$RC"
+check "within 1 W says already" "already turbo" "$OUT"
+check_file "within 1 W left GPU 0 alone" "$H/pl0" 189
+# 2 W off is a drift.
+printf '188\n' > "$H/pl0"
+run_pm "$H" turbo
+check_file "2 W off reapplied" "$H/pl0" 190
+
+# --force applies even when everything matches.
+run_pm "$H" turbo
+check "already before force" "already turbo" "$OUT"
+run_pm "$H" --force turbo
+check "force exit" 0 "$RC"
+check "force output" "" "$OUT"
+expect_has "force sends the writes" "-rgc" "$(smi_log "$H")"
+expect_state "$H" turbo
+
+# A different mode is never "already": default is applied.
+run_pm "$H" default
+check "mode change exit" 0 "$RC"
+check "mode change output" "" "$OUT"
+expect_state "$H" default
+expect_intel "$H" 0 100
+expect_rapl "$H" 125000000 190000000
+
+# Recorded silent but the live caps still at default (an earlier run failed half way): silent is applied.
+printf 'silent\n' > "$H/var/lib/powermode/mode"
+run_pm "$H" silent
+check "recorded silent but live default applies" "" "$OUT"
+expect_intel "$H" 1 60
+expect_state "$H" silent
+
+# Concurrency: a second run waits on the lock while the first is inside its writes, then finds
+# the mode already applied. The first run writes the -pm call only after taking the lock.
+J=$T/j
+make_tree "$J"
+( POWERMODE_SYSFS_ROOT="$J" POWERMODE_NVIDIA_SMI="$T/bin/nvidia-smi" FAKE_SMI_LOG="$J/smi.log" \
+  FAKE_SMI_DIR="$J" FAKE_SMI_SLEEP=2 "$PM" turbo > "$J/a.out" 2>&1; echo $? > "$J/a.rc" ) &
+for i in $(seq 1 100); do grep -q -- "-pm" "$J/smi.log" 2>/dev/null && break; sleep 0.1; done
+( POWERMODE_SYSFS_ROOT="$J" POWERMODE_NVIDIA_SMI="$T/bin/nvidia-smi" FAKE_SMI_LOG="$J/smi.log" \
+  FAKE_SMI_DIR="$J" "$PM" turbo > "$J/b.out" 2>&1; echo $? > "$J/b.rc" ) &
+wait
+check_file "concurrent first exit" "$J/a.rc" 0
+check_file "concurrent second exit" "$J/b.rc" 0
+check "concurrent first output" "" "$(cat "$J/a.out")"
+check "concurrent second waited and found it applied" "already turbo" "$(cat "$J/b.out")"
+expect_state "$J" turbo
+
+# A lock held past LOCK_TIMEOUT: the run gives up with a message and touches nothing.
+K=$T/k
+make_tree "$K"
+mkdir -p "$K/run"
+flock "$K/run/powermode.lock" -c "touch '$K/held'; sleep 4" &
+for i in $(seq 1 100); do [ -e "$K/held" ] && break; sleep 0.1; done
+run_pm_timeout() {
+  OUT=$(POWERMODE_LOCK_TIMEOUT=1 POWERMODE_SYSFS_ROOT="$K" POWERMODE_NVIDIA_SMI="$T/bin/nvidia-smi" \
+    FAKE_SMI_LOG="$K/smi.log" FAKE_SMI_DIR="$K" "$PM" "$@" 2>&1)
+  RC=$?
+}
+run_pm_timeout turbo
+check "held lock exit" 1 "$RC"
+expect_has "held lock message" "another run still holds $K/run/powermode.lock after 1s; giving up" "$OUT"
+check "held lock wrote nothing" "" "$(smi_log "$K")"
+[ ! -e "$K/var/lib/powermode/mode" ] && [ ! -e "$K/run/powermode" ] \
+  && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL: held lock recorded a mode"; }
+wait
 
 echo "powermode tests: $pass passed, $fail failed"
 if (( fail > 0 )); then

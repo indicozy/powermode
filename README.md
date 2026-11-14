@@ -31,14 +31,39 @@ delegation drop-in.
 
 ## Usage
 
-    powermode silent|default|turbo    apply a mode and record it
-    powermode status                 show the recorded mode and the live readout (no root needed)
-    powermode boot                   re-apply the recorded mode (used by the service)
+    powermode [--force] silent|default|turbo   apply a mode and record it
+    powermode status                           show the recorded mode and the live readout (no root needed)
+    powermode boot                             re-apply the recorded mode (used by the service)
+
+Applying is idempotent. If the recorded mode already equals the requested one and a live check
+matches it (no_turbo, max_perf_pct, RAPL PL1/PL2 within 1 W, each GPU's power.limit within 1 W),
+`powermode MODE` prints `already MODE` and writes nothing. `--force` applies anyway. Any drift
+(say a sysfs value changed by hand) makes the next run apply. `boot` always applies.
+
+Every apply and boot holds an flock on `/run/powermode.lock`. A second run waits for the first, up to
+60 s, and then fails with a message. A run that waits for nothing takes no lock: `status` never does.
+
+## Bar
+
+The i3bar power block shows the mode and renders as follows:
+
+- while a change runs it reads `⏳ TARGET…` in grey and ignores every click until the command exits
+  (a safety timeout of 60 s clears it anyway);
+- if the command exits nonzero, or cannot start, the block stays red for 30 s, or until the next
+  successful change (the failure is also logged in `~/.cache/powermode-bar.log`);
+- ` 🔒` is appended while `~/.config/powermode/lock` exists (`POWERMODE_LOCK` overrides the path).
+
+A click on the power block is the owner choosing a mode by hand, so it deletes the lock file first
+(logged as `bar: lock released`) and then launches the change. The `ai` block follows the same rules
+(grey `⏳ away…` / `⏳ desk…` while busy, red on failure), but has no lock.
 
 ## Tests
 
-    test/run.sh                                      fake sysfs tree and fake nvidia-smi
-    python3 -I test/test_power_block.py              i3bar block and click handling
+    test/run.sh                                      fake sysfs tree and fake nvidia-smi (idempotency, drift,
+                                                     --force, 1 W tolerance, lock serialisation and timeout)
+    test/ai_resources_run.sh                         ai-resources and ai-run shell checks
+    test/claude_hook_run.sh                          Claude hook: first sight, change, garbage, session ids
+    python3 -B -I -m unittest discover -s test       i3bar power and ai blocks: busy, failed, lock, clicks
 
 ## ai-resources
 
@@ -73,7 +98,15 @@ On every switch (and on `apply`) the state is applied to running work:
   `taskset -a -cp` to the state's CPUs, in both directions (away widens jobs back to 0-19);
 - desk warns about processes still on GPU 0 (it does not stop them).
 
-Switching to away changes nothing else. The script needs no sudo. Its `~/.local/bin/ai-resources` is
+Switching to away changes nothing else. A switch to the state already in effect (`desk` while desk)
+does not rewrite the state file and does not signal the bar, but it still applies the state, so
+stragglers are re-pinned. A missing state file is written on an explicit `desk` or `away`.
+
+`setup`, `apply`, `desk`, `away` and `toggle` hold an flock on `~/.cache/ai-resources/lock`
+(`AI_RESOURCES_LOCK` overrides it), so concurrent runs serialise; a run waits up to 60 s, then fails.
+`status`, `mode`, `cpus`, `gpus` and `prefix` take no lock.
+
+The script needs no sudo. Its `~/.local/bin/ai-resources` is
 a symlink to this script. `ai-resources setup` links the unit into `~/.config/systemd/user/`; the
 slice's properties are set persistently with `set-property`, so they survive a restart of the session.
 
@@ -83,10 +116,7 @@ live state, power mode and lock on first sight, and again only when they change 
 the owner: ..."). Its per-session memory is `~/.cache/ai-resources/seen/<session_id>`. It always exits 0.
 A running session learns of a switch on its next prompt or tool use.
 
-Tests (fake state dir, nvidia-smi, /proc, taskset, pkill, systemctl, cgroup tree and systemd-run;
-never the real state, the real user manager or real affinities):
-
-    test/ai_resources_run.sh                         ai-resources and ai-run shell checks
-    test/claude_hook_run.sh                          Claude hook: first sight, change, garbage, session ids
-    python3 -B -I -m unittest discover -s test       i3bar power and ai blocks and click handling
+Tests (fake state dir, lock, nvidia-smi, /proc, taskset, pkill, systemctl, cgroup tree and systemd-run;
+never the real state, the real user manager or real affinities). The commands are listed under
+Tests above.
 

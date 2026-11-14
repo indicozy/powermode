@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # powermode: switch CPU, RAPL and GPU power caps between silent, default and turbo.
 #
-#   powermode silent|default|turbo   apply a mode (root) and record it
+#   powermode [--force] silent|default|turbo   apply a mode (root) and record it; a mode that is
+#                                              already recorded and live-verified is left alone
+#                                              ("already MODE"), --force applies it anyway
 #   powermode boot                  re-apply the recorded mode (powermode.service)
 #   powermode status                show the recorded mode and a live readout (any user)
+#
+# Every apply and boot holds an flock on $ROOT/run/powermode.lock; a second run waits for the
+# first (POWERMODE_LOCK_TIMEOUT seconds, default 60, then fails).
 #
 # Test hooks: POWERMODE_SYSFS_ROOT is prefixed to every /sys, /run and /var/lib path,
 # POWERMODE_NVIDIA_SMI replaces the nvidia-smi binary.
@@ -17,12 +22,15 @@ CPU_DIR=$ROOT/sys/devices/system/cpu
 RAPL_DIR=$ROOT/sys/class/powercap/intel-rapl:0
 MODE_FILE=$ROOT/var/lib/powermode/mode
 STATE_FILE=$ROOT/run/powermode
+LOCK_FILE=$ROOT/run/powermode.lock
+LOCK_TIMEOUT=${POWERMODE_LOCK_TIMEOUT:-60}
 GPU_LIMITS=index,power.min_limit,power.default_limit,power.max_limit
 
 FAILED=0
+FORCE=0
 
 usage() {
-  echo "usage: powermode silent|default|turbo|boot|status" >&2
+  echo "usage: powermode [--force] silent|default|turbo|boot|status" >&2
 }
 
 warn() {
@@ -147,6 +155,92 @@ record_mode() {
     || warn "cannot record mode $1"
 }
 
+# take_lock: hold LOCK_FILE for the rest of the run; a run waits up to LOCK_TIMEOUT seconds.
+take_lock() {
+  if ! { mkdir -p "$(dirname "$LOCK_FILE")" && exec 9>>"$LOCK_FILE"; } 2>/dev/null; then
+    echo "powermode: cannot open $LOCK_FILE" >&2
+    exit 1
+  fi
+  if ! flock -w "$LOCK_TIMEOUT" 9; then
+    echo "powermode: another run still holds $LOCK_FILE after ${LOCK_TIMEOUT}s; giving up" >&2
+    exit 1
+  fi
+}
+
+# within_one A B: two whole-watt (or whole-number) readings differ by at most 1. A non-number is no.
+within_one() {
+  [[ $1 =~ ^[0-9]+$ && $2 =~ ^[0-9]+$ ]] || return 1
+  local diff=$(( $1 - $2 ))
+  (( diff >= -1 && diff <= 1 ))
+}
+
+# gpus_match KIND: every GPU's live power limit is within 1 W of its min, default or max limit.
+# Reads only. No GPUs listed counts as no match, so the mode is applied.
+gpus_match() {
+  local kind=$1 query current idx lo def hi want cur seen=0
+  local -A wanted=()
+  query=$("$NVSMI" --query-gpu="$GPU_LIMITS" --format=csv,noheader,nounits 2>/dev/null) || return 1
+  while IFS=, read -r idx lo def hi; do
+    idx=${idx//[[:space:]]/}
+    [[ $idx =~ ^[0-9]+$ ]] || continue
+    case $kind in
+      min) want=$(whole_number "$lo") ;;
+      default) want=$(whole_number "$def") ;;
+      max) want=$(whole_number "$hi") ;;
+    esac
+    wanted[$idx]=$want
+  done <<< "$query"
+  (( ${#wanted[@]} > 0 )) || return 1
+  current=$("$NVSMI" --query-gpu=index,power.limit --format=csv,noheader,nounits 2>/dev/null) || return 1
+  while IFS=, read -r idx cur; do
+    idx=${idx//[[:space:]]/}
+    [[ $idx =~ ^[0-9]+$ ]] || continue
+    [[ -n ${wanted[$idx]:-} ]] || return 1
+    cur=$(whole_number "$cur")
+    within_one "$cur" "${wanted[$idx]}" || return 1
+    seen=$((seen + 1))
+  done <<< "$current"
+  (( seen == ${#wanted[@]} ))
+}
+
+# settings_match MODE: the live no_turbo, max_perf_pct, RAPL limits and GPU power limits all match
+# MODE. Reads only; any unreadable value counts as a mismatch.
+settings_match() {
+  local no_turbo max_perf pl1 pl2 gpu_kind
+  case $1 in
+    silent) no_turbo=1; max_perf=60; pl1=65; pl2=90; gpu_kind=min ;;
+    default) no_turbo=0; max_perf=100; pl1=125; pl2=190; gpu_kind=default ;;
+    turbo) no_turbo=0; max_perf=100; pl1=190; pl2=190; gpu_kind=max ;;
+    *) return 1 ;;
+  esac
+  [[ $(read_value "$PSTATE_DIR/no_turbo") == "$no_turbo" ]] || return 1
+  [[ $(read_value "$PSTATE_DIR/max_perf_pct") == "$max_perf" ]] || return 1
+  within_one "$(read_watts "$RAPL_DIR/constraint_0_power_limit_uw")" "$pl1" || return 1
+  within_one "$(read_watts "$RAPL_DIR/constraint_1_power_limit_uw")" "$pl2" || return 1
+  gpus_match "$gpu_kind"
+}
+
+# recorded_mode: the mode in MODE_FILE, or an empty line when it is missing or not a known mode.
+recorded_mode() {
+  local mode=""
+  mode=$(head -n 1 "$MODE_FILE" 2>/dev/null) || mode=""
+  case $mode in
+    silent|default|turbo) printf '%s\n' "$mode" ;;
+    *) printf '\n' ;;
+  esac
+}
+
+# apply_requested MODE: skip the writes when MODE is recorded and the live settings already match
+# (so repeating a mode leaves identical state); otherwise apply it. --force always applies.
+apply_requested() {
+  local mode=$1
+  if (( FORCE == 0 )) && [[ $(recorded_mode) == "$mode" ]] && settings_match "$mode"; then
+    echo "already $mode"
+    return 0
+  fi
+  apply_mode "$mode"
+}
+
 apply_mode() {
   local mode=$1
   run_smi -pm 1
@@ -208,14 +302,39 @@ show_status() {
 }
 
 main() {
-  if (( $# != 1 )); then
+  local arg
+  local args=()
+  for arg in "$@"; do
+    if [[ $arg == --force ]]; then
+      FORCE=1
+    else
+      args+=("$arg")
+    fi
+  done
+  if (( ${#args[@]} != 1 )); then
     usage
     exit 2
   fi
-  case $1 in
-    silent|default|turbo) apply_mode "$1" ;;
-    boot) boot_mode ;;
-    status) show_status ;;
+  case ${args[0]} in
+    silent|default|turbo)
+      take_lock
+      apply_requested "${args[0]}"
+      ;;
+    boot)
+      if (( FORCE )); then
+        usage
+        exit 2
+      fi
+      take_lock
+      boot_mode
+      ;;
+    status)
+      if (( FORCE )); then
+        usage
+        exit 2
+      fi
+      show_status
+      ;;
     *)
       usage
       exit 2

@@ -7,13 +7,18 @@
 #   setup  link systemd/ai.slice into the user unit dir, reload systemd, start the slice, apply.
 #   apply  push the current state onto running AI work (cpuset on ai.slice when available,
 #          re-pin ai.slice and nice-19 processes). Never fails the caller.
-# Env overrides (tests): AI_RESOURCES_STATE, AI_RESOURCES_NVIDIA_SMI, AI_RESOURCES_PROC,
-#                        AI_RESOURCES_TASKSET, AI_RESOURCES_PKILL, AI_RESOURCES_SYSTEMCTL,
-#                        AI_RESOURCES_CGROUP_ROOT, AI_RESOURCES_UNIT_DIR.
+#   desk|away when already in that state: the state file is not rewritten and the bar is not
+#          signalled, but the state is still applied (re-pins stragglers).
+# setup, apply, desk, away and toggle hold an flock on $AI_RESOURCES_LOCK (default
+# ~/.cache/ai-resources/lock) so concurrent runs serialise; a run waits up to 60 s, then fails.
+# Env overrides (tests): AI_RESOURCES_STATE, AI_RESOURCES_LOCK, AI_RESOURCES_NVIDIA_SMI,
+#                        AI_RESOURCES_PROC, AI_RESOURCES_TASKSET, AI_RESOURCES_PKILL,
+#                        AI_RESOURCES_SYSTEMCTL, AI_RESOURCES_CGROUP_ROOT, AI_RESOURCES_UNIT_DIR.
 set -euo pipefail
 
 SELF_DIR=$(cd "$(dirname "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 STATE=${AI_RESOURCES_STATE:-$HOME/.config/ai-resources/mode}
+LOCK=${AI_RESOURCES_LOCK:-$HOME/.cache/ai-resources/lock}
 NVIDIA_SMI=${AI_RESOURCES_NVIDIA_SMI:-nvidia-smi}
 PROC=${AI_RESOURCES_PROC:-/proc}
 TASKSET=${AI_RESOURCES_TASKSET:-taskset}
@@ -188,12 +193,30 @@ status_line() {
   echo "$m cpus=$(cpus_for "$m") gpus=$(gpus_for "$m")"
 }
 
-# set_mode MODE: record the mode, apply it to running work, refresh the i3 bar, print status.
+# set_mode MODE: unless the state file already holds MODE, record it and refresh the i3 bar. Either
+# way the state is applied to running work again, so a repeated switch re-pins stragglers and
+# changes nothing else. A missing file is written (it makes the state explicit). Prints the status.
 set_mode() {
-  write_mode "$1"
-  apply_state
-  "$PKILL" -USR1 -x i3status >/dev/null 2>&1 || true
+  if [ ! -f "$STATE" ] || [ "$(current_mode)" != "$1" ]; then
+    write_mode "$1"
+    apply_state
+    "$PKILL" -USR1 -x i3status >/dev/null 2>&1 || true
+  else
+    apply_state
+  fi
   status_line
+}
+
+# take_lock: hold LOCK for the rest of the run; a run waits up to 60 s for the lock, then fails.
+take_lock() {
+  if ! { mkdir -p -- "$(dirname -- "$LOCK")" && exec 9>>"$LOCK"; } 2>/dev/null; then
+    echo "ai-resources: cannot open $LOCK" >&2
+    exit 1
+  fi
+  if ! flock -w 60 9; then
+    echo "ai-resources: another run still holds $LOCK after 60s; giving up" >&2
+    exit 1
+  fi
 }
 
 [ "$#" -le 1 ] || usage
@@ -203,10 +226,11 @@ case "${1:-status}" in
   cpus) cpus_for "$(current_mode)" ;;
   gpus) gpus_for "$(current_mode)" ;;
   prefix) prefix_line ;;
-  apply) apply_state ;;
-  setup) setup ;;
-  desk | away) set_mode "$1" ;;
+  apply) take_lock; apply_state ;;
+  setup) take_lock; setup ;;
+  desk | away) take_lock; set_mode "$1" ;;
   toggle)
+    take_lock
     if [ "$(current_mode)" = away ]; then
       set_mode desk
     else
